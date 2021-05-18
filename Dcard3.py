@@ -27,14 +27,26 @@ def page(p):
 
 
 
-
-
 # error messages
 
 _ERR_LIB = {
     2003: "has_logged_in",
     2007: "token_expired"
 }
+
+
+
+# decorators, helpers
+def _check_token_expired(session_func, *args, **kwargs):
+    result = session_func(*args, **kwargs)
+    
+    j = result.json()
+    if 'error' in j:
+        if j['error'] == 2007:
+            _refresh_token()
+            result = session_func(*args, **kwargs)
+
+    return result
 
 
 
@@ -225,7 +237,9 @@ class Post:
         # unknown            
         self.postAvatar   = ""
 
-        post_json = _session.get(page(f"posts/{postid}")).json()
+        
+        post_json = _check_token_expired(_session.get, page(f"posts/{postid}")).json()
+        
         for _ in post_json:
             setattr(self, _, post_json[_])
 
@@ -267,14 +281,14 @@ class Post:
 
         resp = None
         if reaction is None:
-            resp = _session.delete(page(f'posts/{self.id}/reactions'))
+            resp = _check_token_expired(_session.delete, page(f'posts/{self.id}/reactions'))
         else:
             if reaction in reactions:
-                resp =  _session.post(page(f'posts/{self.id}/reactions'), data={'reactionId': reactions[reaction]['id']})
+                resp =  _check_token_expired(_session.post, page(f'posts/{self.id}/reactions'), data={'reactionId': reactions[reaction]['id']})
             else:
                 for react in reactions:
                     if reaction in reactions[react]['aliases']:
-                        resp = _session.post(page(f'posts/{self.id}/reactions'), data={'reactionId': reactions[react]['id']})
+                        resp = _check_token_expired(_session.post, page(f'posts/{self.id}/reactions'), data={'reactionId': reactions[react]['id']})
                         break
                 else:
                     print('[Error] Invalid reaction:', reaction)
@@ -298,7 +312,7 @@ class Post:
         return postImg(forum, title, content1, *contents, topics=(), reply=self,  anonymous=False)
     
 
-    # post operations
+    # post comments
     def refresh(self):
         post_id = self.id
         self.__init__(self.id)
@@ -311,21 +325,26 @@ class Post:
         if floor>floors:
             return
         elif floor>0:
-            return Post.Comment(**_session.get(page(f"posts/{self.id}/comments?after={floor-1}")).json()[0])
+            return Post.Comment(**_check_token_expired(_session.get, page(f"posts/{self.id}/comments?after={floor-1}")).json()[0])
         elif 0>floor>=-floors:
-            return Post.Comment(**_session.get(page(f"posts/{self.id}/comments?after={floors-floor}")).json()[0])
+            return Post.Comment(**_check_token_expired(_session.get, page(f"posts/{self.id}/comments?after={floors-floor}")).json()[0])
         else:
             return
     @property
     def comments(self):
         uplimit = 100 # may be changed
         for after in range(0, self.commentCount+uplimit, uplimit):
-            for comment in map(lambda kw:Post.Comment(**kw), _session.get(page(f"posts/{self.id}/comments?after={after}&limit={uplimit}")).json()):
-                yield comment            
+            for comment in map(lambda kw:Post.Comment(**kw), _check_token_expired(_session.get, page(f"posts/{self.id}/comments?after={after}&limit={uplimit}")).json()):
+                yield comment
         #return cmts
 
+    @property
+    def links(self):
+        return _check_token_expired(_session.get, page(f'posts/{self.id}/links'))
+
+    # post operations
     def delete(self):
-        dlpost = _session.delete(page(f"posts/{self.id}"))
+        dlpost = _check_token_expired(_session.delete, page(f"posts/{self.id}"))
         return dlpost
 
     def export(self, filename=None, directory=".", logmode="B"):
@@ -368,13 +387,13 @@ def posts(forum="", popular=False, limit=30, before=0):
     
     posts_json = []
     while limit > max_limit:
-        posts_json += _session.get(page((forum and ("forums/" + forum + "/"))
+        posts_json += _check_token_expired(_session.get, page((forum and ("forums/" + forum + "/"))
                                    +f"posts?popular={str(popular).lower()}&limit={max_limit}"
                                    + [f"&before={before}", ""][before<1])).json()
         before = posts_json[-1]['id']
         limit -= max_limit
     else:
-        posts_json += _session.get(page((forum and ("forums/" + forum + "/"))
+        posts_json += _check_token_expired(_session.get, page((forum and ("forums/" + forum + "/"))
                                    +f"posts?popular={str(popular).lower()}&limit={limit}"
                                    + [f"&before={before}", ""][before<1])).json()
         
@@ -447,7 +466,7 @@ def post(forum, title, content1, *contents, topics=(), reply="", anonymous=False
 
     for _ in range(12):
         try:
-            p = _session.post(page(suburl), data=data).json()['id']
+            p = _check_token_expired(_session.post, page(suburl), data=data).json()['id']
             postid = Post(p)
             break
         except:
@@ -456,8 +475,8 @@ def post(forum, title, content1, *contents, topics=(), reply="", anonymous=False
                 _sleep(5)
                 continue
     else:
-        print("[Error] Post Failed")
-        return
+        raise Exception('[Error] Post Failed')
+        
     if content_more:
         reply(postid, content_more)
     print(f"[Succeed] Posted: {title} - https://www.dcard.tw/f/{forum}/p/{postid.id}")
@@ -530,7 +549,6 @@ def postImg(forum, title, content1, *contents, topics=(), reply="", anonymous=Fa
     '''
 
 
-
 def reply(postid, content1, *contents):
     suburl = f"posts/{postid}/comments"
 
@@ -546,15 +564,15 @@ def reply(postid, content1, *contents):
 
     for t in range(10):
         try:
-            cmt = Post.Comment(**_session.post(page(suburl), data={"content":content}).json())
+            cmt = Post.Comment(**_check_token_expired(_session.post, page(suburl), data={"content":content}).json())
             break
         except:
             print(f"[Error] Failed to reply, retrying... ({t+1})")
             _sleep(1)
     else:
         # failed for 10 times
-        print("[Notice] Failed to reply.")
-        return Post.Comment() # empty comment object
+        raise Exception("[Notice] Failed to reply.")
+##        return Post.Comment() # empty comment object
     p = Post(postid)
     
     if content_more:
