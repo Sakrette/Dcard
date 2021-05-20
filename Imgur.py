@@ -1,4 +1,4 @@
-import requests, json
+import requests, json, base64
 
 _clientID=""
 
@@ -21,7 +21,7 @@ def upload(img, name="", album="", description="", filetype="file"):
         print("Uploading file:", img)
         try:
             with open(img, "rb") as f:
-                img = f.read()
+                img = base64.b64encode(f.read())
         except:
             # cannot read file or file not exists
             return #None
@@ -29,7 +29,7 @@ def upload(img, name="", album="", description="", filetype="file"):
                         data={"image":img,
                               "name" :name,
                               "album":album,
-                              "type" :"url" if filetype=="url" else "file",
+                              "type" :"url" if filetype=="url" else "base64",
                               "description":description},
                         headers={"Authorization":f"Client-ID {_clientID}"})
     #print(response.text)
@@ -43,7 +43,7 @@ def upload(img, name="", album="", description="", filetype="file"):
                 print(response.headers)
             else:
                 print(f"[{error['code']}] {error['status']}")
-        elif result["code"]==200 and "data" in result:
+        elif result["status"]==200 and "data" in result:
             return ImageData(result["data"])
         else:
             print("Uncaught error in Imgur.py")

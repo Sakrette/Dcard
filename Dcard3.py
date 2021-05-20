@@ -5,6 +5,8 @@ import re as _re, os as _os
 from datetime import datetime as _datetime
 from pytz import timezone as _timezone
 import pickle as _pickle, json as _json
+from http.cookies import SimpleCookie as _SimpleCookie
+import platform
 
 # local modules
 import Imgur as _Imgur
@@ -16,7 +18,13 @@ _now = _datetime.now
 _postSignature = _replySignature = ""
 _apiroot = "https://www.dcard.tw/service/api/v2/"
 
+
+PyVer = ".".join(map(str, _os.sys.version_info[:3]))
+Platform = f'{platform.system()} {_os.name.upper()} {platform.release()}'
+UserAgent = {'User-Agent': f'Mozilla/5.0 ({Platform}; {_os.sys.platform.capitalize()})'}
+
 scraper = _cloudscraper.create_scraper()
+scraper.headers.update(UserAgent)
 _session = scraper #.Session()
 
 __path__ = _re.match(r".*[\\/]", __file__)[0]
@@ -43,7 +51,7 @@ def _check_token_expired(session_func, *args, **kwargs):
     j = result.json()
     if 'error' in j:
         if j['error'] == 2007:
-            _refresh_token()
+            _refresh()
             result = session_func(*args, **kwargs)
 
     return result
@@ -59,11 +67,12 @@ def newSession(session=None):
     global _session
     if session is None:
         _session = _cloudscraper.create_scraper() #Dc Session()
+        scraper.headers.update(UserAgent)
     else:
         _session = session
 
 
-def loadUser(user):
+def loadUser(user, login=True):
     global _postSignature, _replySignature
     _account = _password = _postSignature = _replySignature = ""
     if not _os.access(__path__ + "user.ini", _os.F_OK):
@@ -101,6 +110,9 @@ def loadUser(user):
     if _account == "" or _password == "":
         print(f"Load User Faild: {user}")
         return
+    elif not login:
+        print(f"Loaded User Data: {user}")
+        return
     else:
         # read last token from __TOKENS__.txt
 ##        token = ""
@@ -112,7 +124,7 @@ def loadUser(user):
 ##        if token:
 ##            print("[Notice] Read Token:", token)
 ##        else:
-        _refresh_token()
+        _refresh(True)
         response = _session.post("https://www.dcard.tw/service/sessions", json={"email":_account, "password":_password})
         if response.status_code == 204:
             print("[Notice] Logged in successfully!")
@@ -123,28 +135,36 @@ def loadUser(user):
         return response
 
 # Token
-def _refresh_token():
-    headers = _session.get("https://www.dcard.tw/service/_ping").headers
-    #print(dir(_session))
-    #print(headers)
-    token = headers['X-CSRF-TOKEN']
-    print("[Notice] New token:", token)
-    #print(_now(), ":", token, file=_fileopen(__path__ + "__TOKENS__.txt", "a+"))
-    _session.headers.update({"X-CSRF-TOKEN":token})
-    _session.post("https://www.dcard.tw/service/oauth/refresh")
+def _refresh(get_token=False):
+    if get_token:
+        headers = _session.get("https://www.dcard.tw/service/_ping").headers
+        #print(dir(_session))
+        #print(headers)
+        token = headers['X-CSRF-TOKEN']
+        print("[Notice] New token:", token)
+        #print(_now(), ":", token, file=_fileopen(__path__ + "__TOKENS__.txt", "a+"))
+        _session.headers.update({"X-CSRF-TOKEN":token})
+
+    resp = _session.post("https://www.dcard.tw/service/oauth/refresh")
+    if 'Set-Cookie' in resp.headers:
+        cookies = _SimpleCookie(resp.headers['Set-Cookie'].replace('httponly,', 'httponly;'))
+        for c in cookies:
+            cookies[c].update({'expires': _datetime.strptime(cookies[c]['expires'], '%a, %d %b %Y %H:%M:%S GMT').strftime('%a, %d-%b-%Y %H:%M:%S GMT')})
+        _session.cookies.update(cookies)
+        _save_data()
 
 # Cookies
 def _save_data(pkl_file="__cookies__.pkl"):
     # dump login data
     _dcard_cookies = _cloudscraper.requests.cookies.RequestsCookieJar()
     for cookie in _session.cookies:
-        if cookie.domain == ".dcard.tw":
+        #if cookie.domain == ".dcard.tw":
             _dcard_cookies.set_cookie(cookie)
     _pickle.dump(_dcard_cookies, _fileopen(pkl_file, "wb"))
 def _load_data(pkl_file="__cookies__.pkl"):
     _dcard_cookies = _pickle.load(_fileopen(pkl_file, "rb"))
     _session.cookies.update(_dcard_cookies)
-    _refresh_token()
+    _refresh(True)
     
 
 def setSignature(psign, rsign=None):
@@ -196,7 +216,7 @@ class Post:
                 setattr(self, _, kwargs[_])
                 
         def __str__(self):
-            poster   = f"B{self.floor} {self.gender} {self.school} " + "@"[:self.withNickname] + self.department
+            poster   = f"B{self.floor} {self.gender} {self.school} " + "@"[:self.withNickname] + + ('' if self.anonymousDepartment else self.department)
             posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
             content  = self.content
             return poster + " " + posttime + "\n" + content
@@ -245,7 +265,7 @@ class Post:
 
     def __str__(self):
         title    = self.title
-        poster   = f"{self.gender} {self.school} " + "@"[:self.withNickname] + self.department
+        poster   = f"{self.gender} {self.school} " + "@"[:self.withNickname] + + ('' if self.anonymousDepartment else self.department)
         posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
         content  = self.content
         return "\n".join([title, poster + " " + posttime, content])
@@ -317,7 +337,7 @@ class Post:
         post_id = self.id
         self.__init__(self.id)
         if self.commentCount == -1:
-            _refresh_token()
+            _refresh()
             self.__init__(post_id)
         print("Comments:", self.commentCount)
     def comment(self, floor):
@@ -401,6 +421,12 @@ def posts(forum="", popular=False, limit=30, before=0):
         def __init__(self, json):
             for _ in json:
                 setattr(self, _, json[_])
+        def __repr__(self):
+            title    = self.title
+            poster   = f"{self.gender} {self.school} " + "@"[:self.withNickname] + ('' if self.anonymousDepartment else self.department)
+            posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
+            content  = self.excerpt
+            return "\n".join([title, poster + " " + posttime, content])
     
     return [*map(PostOverlook, posts_json)]
 
@@ -410,13 +436,13 @@ class me:
     def info(self):
         if 'dg-authorization' in _session.headers:
             del _session.headers['dg-authorization']
-            _refresh_token()
+            _refresh()
         resp_me = _session.get(page('me'))
-        return resp_me
+        return resp_me.json()
 
     @classmethod
     def posts(password, before=-1):
-        _refresh_token()
+        _refresh()
         resp_sudo = _session.post("https://www.dcard.tw/service/oauth/sudo", json=({"password": password, "grant_type":"refresh_token"}))
         if resp_sudo.status_code != 200:
             print(resp_sudo)
@@ -517,7 +543,7 @@ def postImg(forum, title, content1, *contents, topics=(), reply="", anonymous=Fa
                 c = c[2:]
             content += c
         content += "\n"
-    content += _postSignature
+##    content += _postSignature
     
     return post(forum, title, content, topics=topics, reply=reply, anonymous=anonymous)
     '''
