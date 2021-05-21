@@ -110,7 +110,7 @@ def loadUser(user, login=True):
     if _account == "" or _password == "":
         print(f"Load User Faild: {user}")
         return
-    elif not login:
+    elif not login or isLogin():
         print(f"Loaded User Data: {user}")
         return
     else:
@@ -124,7 +124,7 @@ def loadUser(user, login=True):
 ##        if token:
 ##            print("[Notice] Read Token:", token)
 ##        else:
-        _refresh(True)
+        _refresh()
         response = _session.post("https://www.dcard.tw/service/sessions", json={"email":_account, "password":_password})
         if response.status_code == 204:
             print("[Notice] Logged in successfully!")
@@ -148,10 +148,23 @@ def _refresh(get_token=False):
     resp = _session.post("https://www.dcard.tw/service/oauth/refresh")
     if 'Set-Cookie' in resp.headers:
         cookies = _SimpleCookie(resp.headers['Set-Cookie'].replace('httponly,', 'httponly;'))
+        print("[Notice] Refresh Cookies:")
         for c in cookies:
             cookies[c].update({'expires': _datetime.strptime(cookies[c]['expires'], '%a, %d %b %Y %H:%M:%S GMT').strftime('%a, %d-%b-%Y %H:%M:%S GMT')})
+
+            # refresh info
+            c_name  = c
+            c_value = cookies[c_name].value
+            if len(c_value) > 21:
+                c_value = c_value[:9] + '...' + c_value[-9:]
+            print(' '*12, c_name + '=' + c_value)
         _session.cookies.update(cookies)
         _save_data()
+    elif not get_token:
+        # if failed (no Set-Cookie) without new token, try again with token refreshed
+        _refresh(True)
+    else:
+        raise Exception('[Error] Failed to refresh')
 
 # Cookies
 def _save_data(pkl_file="__cookies__.pkl"):
@@ -164,7 +177,7 @@ def _save_data(pkl_file="__cookies__.pkl"):
 def _load_data(pkl_file="__cookies__.pkl"):
     _dcard_cookies = _pickle.load(_fileopen(pkl_file, "rb"))
     _session.cookies.update(_dcard_cookies)
-    _refresh(True)
+    _refresh()
     
 
 def setSignature(psign, rsign=None):
@@ -216,10 +229,15 @@ class Post:
                 setattr(self, _, kwargs[_])
                 
         def __str__(self):
-            poster   = f"B{self.floor} {self.gender} {self.school} " + "@"[:self.withNickname] + + ('' if self.anonymousDepartment else self.department)
+            poster   = f"B{self.floor} {self.gender} {self.school} " + "@"[:self.withNickname] + self.department
             posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
             content  = self.content
             return poster + " " + posttime + "\n" + content
+
+        def like(self):
+            return _check_token_expired(_session.post, page(f'comments/{self.id}/like'))
+        def unlike(self):
+            return _check_token_expired(_session.delete, page(f'comments/{self.id}/like'))
 
         def delete(self):
             dlcmt = _session.delete(page(f"comments/{self.id}"))
@@ -265,10 +283,16 @@ class Post:
 
     def __str__(self):
         title    = self.title
-        poster   = f"{self.gender} {self.school} " + "@"[:self.withNickname] + + ('' if self.anonymousDepartment else self.department)
+        poster   = f"{self.gender} {self.school} " + "@"[:self.withNickname] + ('' if self.anonymousDepartment else self.department)
         posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
         content  = self.content
         return "\n".join([title, poster + " " + posttime, content])
+
+    # like/unlike
+    def like(self):
+        return _check_token_expired(_session.post, page(f'posts/{self.id}/like'))
+    def unlike(self):
+        return _check_token_expired(_session.delete, page(f'posts/{self.id}/like'))
 
     # reaction
     def react(self, reaction=None):
@@ -301,7 +325,8 @@ class Post:
 
         resp = None
         if reaction is None:
-            resp = _check_token_expired(_session.delete, page(f'posts/{self.id}/reactions'))
+##            resp = _check_token_expired(_session.delete, page(f'posts/{self.id}/reactions'))
+            resp = self.unlike()
         else:
             if reaction in reactions:
                 resp =  _check_token_expired(_session.post, page(f'posts/{self.id}/reactions'), data={'reactionId': reactions[reaction]['id']})
@@ -313,7 +338,7 @@ class Post:
                 else:
                     print('[Error] Invalid reaction:', reaction)
                     return
-        return resp.content
+        return resp
         
     #reply
     def reply   (self, content1, *contents):
@@ -336,9 +361,6 @@ class Post:
     def refresh(self):
         post_id = self.id
         self.__init__(self.id)
-        if self.commentCount == -1:
-            _refresh()
-            self.__init__(post_id)
         print("Comments:", self.commentCount)
     def comment(self, floor):
         floors = self.commentCount
@@ -401,6 +423,19 @@ class Post:
                     if (comment.floor-1)/self.commentCount*100//1 != comment.floor/self.commentCount*100//1:
                         print(f"Exported {comment.floor/self.commentCount*100//1}%")
         print(f"Export Completed: {filename} ({filesize} bytes)")
+
+
+        
+class PostOverlook:
+    def __init__(self, json):
+        for _ in json:
+            setattr(self, _, json[_])
+    def __str__(self):
+        title    = self.title
+        poster   = f"{self.gender} {self.school} " + "@"[:self.withNickname] + ('' if self.anonymousDepartment else self.department)
+        posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
+        content  = self.excerpt
+        return "\n".join([title, poster + " " + posttime, content])
     
 def posts(forum="", popular=False, limit=30, before=0):
     max_limit = 100
@@ -416,17 +451,6 @@ def posts(forum="", popular=False, limit=30, before=0):
         posts_json += _check_token_expired(_session.get, page((forum and ("forums/" + forum + "/"))
                                    +f"posts?popular={str(popular).lower()}&limit={limit}"
                                    + [f"&before={before}", ""][before<1])).json()
-        
-    class PostOverlook:
-        def __init__(self, json):
-            for _ in json:
-                setattr(self, _, json[_])
-        def __repr__(self):
-            title    = self.title
-            poster   = f"{self.gender} {self.school} " + "@"[:self.withNickname] + ('' if self.anonymousDepartment else self.department)
-            posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
-            content  = self.excerpt
-            return "\n".join([title, poster + " " + posttime, content])
     
     return [*map(PostOverlook, posts_json)]
 
@@ -441,17 +465,16 @@ class me:
         return resp_me.json()
 
     @classmethod
-    def posts(password, before=-1):
-        _refresh()
-        resp_sudo = _session.post("https://www.dcard.tw/service/oauth/sudo", json=({"password": password, "grant_type":"refresh_token"}))
+    def posts(cls, password, before=-1):
+        resp_sudo = _check_token_expired(_session.post, "https://www.dcard.tw/service/oauth/sudo", json={"password": password, "grant_type":"refresh_token"})
         if resp_sudo.status_code != 200:
             print(resp_sudo)
             return resp_sudo
-        token = json.loads(resp_sudo.text)['accessToken']
+        token = _json.loads(resp_sudo.text)['accessToken']
         _session.headers.update({'dg-authorization': f"Bearer {token}"})
         resp_posts = _session.get(page("me/posts" + ("" if before==-1 else f"?before={before}")))
-        posts = json.loads(resp_posts.text)
-        return posts
+        posts_json = _json.loads(resp_posts.text)
+        return [*map(PostOverlook, posts_json)]
 
 
 ''' -------------------- Post/Reply -------------------- '''
