@@ -47,12 +47,16 @@ _ERR_LIB = {
 # decorators, helpers
 def _check_token_expired(session_func, *args, **kwargs):
     result = session_func(*args, **kwargs)
-    
-    j = result.json()
-    if 'error' in j:
-        if j['error'] == 2007:
-            _refresh()
-            result = session_func(*args, **kwargs)
+
+    if result.content:
+        j = result.json()
+        if 'error' in j:
+            if j['error'] == 2007:
+                _refresh()
+                result = session_func(*args, **kwargs)
+    else:
+        # no content, also no error
+        pass
 
     return result
 
