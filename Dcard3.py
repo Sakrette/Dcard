@@ -38,7 +38,10 @@ def page(p):
 # error messages
 
 _ERR_LIB = {
+    1202: "Post not found",
+    1203: "Comment not found",
     2003: "has_logged_in",
+    2004: "not_logged_in",
     2007: "token_expired"
 }
 
@@ -50,7 +53,7 @@ def _check_token_expired(session_func, *args, **kwargs):
 
     if result.content:
         j = result.json()
-        if 'error' in j:
+        if _check_error(j):
             if j['error'] == 2007:
                 _refresh()
                 result = session_func(*args, **kwargs)
@@ -61,8 +64,17 @@ def _check_token_expired(session_func, *args, **kwargs):
     return result
 
 
-
-
+def _check_error(resp_json, log_error = True):
+    if 'error' in resp_json: # has error code
+        error_id = resp_json['error']
+        if log_error:
+            if error_id in _ERR_LIB:
+                print(f'[Error] {error_id}', _ERR_LIB[error_id])
+            else:
+                print(f'[Error] {error_id}', '(unknown error)', resp_json['message'])
+        return True
+    else: # no error
+        return False
 
 
 ''' -------------------- Settings -------------------- '''
@@ -128,7 +140,7 @@ def loadUser(user, login=True):
 ##        if token:
 ##            print("[Notice] Read Token:", token)
 ##        else:
-        _refresh()
+        _refresh(True)
         response = _session.post("https://www.dcard.tw/service/sessions", json={"email":_account, "password":_password})
         if response.status_code == 204:
             print("[Notice] Logged in successfully!")
@@ -150,11 +162,19 @@ def _refresh(get_token=False):
         _session.headers.update({"X-CSRF-TOKEN":token})
 
     resp = _session.post("https://www.dcard.tw/service/oauth/refresh")
-    if 'Set-Cookie' in resp.headers:
+    if resp.status_code == 400: # Bad Request
+        resp_json = resp.json()
+        if 'error' in resp_json and resp_json['error'] in _ERR_LIB:
+            return resp_json['error']
+        else:
+            raise Exception(f'[Error] Failed to refresh: ({resp_json["error"]}){resp_json["message"]}')
+    elif 'Set-Cookie' in resp.headers:
         cookies = _SimpleCookie(resp.headers['Set-Cookie'].replace('httponly,', 'httponly;'))
         print("[Notice] Refresh Cookies:")
         for c in cookies:
-            cookies[c].update({'expires': _datetime.strptime(cookies[c]['expires'], '%a, %d %b %Y %H:%M:%S GMT').strftime('%a, %d-%b-%Y %H:%M:%S GMT')})
+            # there are 2 datetime types, so it needs to be check first
+            expires_datetime = _datetime.strptime(cookies[c]['expires'], '%a, %d-%b-%y %H:%M:%S GMT' if '-' in cookies[c]['expires'] else '%a, %d %b %Y %H:%M:%S GMT')
+            cookies[c].update({'expires': expires_datetime.strftime('%a, %d-%b-%Y %H:%M:%S GMT')})            
 
             # refresh info
             c_name  = c
@@ -206,20 +226,31 @@ def isLogin():
 ''' -------------------- Get Informations -------------------- '''
 
 class Post:
+    __cached_posts = {}
+    
     class Comment:
+        __cached_comments = {}
+        
         def __init__(self, **kwargs):
             self.floor        = -1    # floor
+            self.doorplate    = ""    # nested floor
             self.host         = False # is the host
             self.gender       = ""    # F/M/D
             self.withNickname = False # is with nickname
             self.school       = ""    # school or nickname
             self.department   = ""    # depart or nickname_id
+            self.postId       = -1    # origin post id
             self.id           = ""    # comment id
             self.content      = ""    # content
+            # parentId
+            # subCommentCount
 
             self.createdAt    = ""
+            self.updatedAt    = ""
             self.isSuspiciousAcount = False
             
+            # reactions
+            self.likeCount    = 0
             
             # reported comment
             self.hidden       = False
@@ -231,13 +262,36 @@ class Post:
 
             for _ in kwargs:
                 setattr(self, _, kwargs[_])
+
+            if self.id != '':
+                self.__cached_comments.update({self.id: self})
                 
         def __str__(self):
-            poster   = f"B{self.floor} {self.gender} {self.school} " + "@"[:self.withNickname] + self.department
+            poster   = f"B{self.doorplate} {self.gender} {self.school} " + "@"[:self.withNickname] + self.department
             posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
             content  = self.content
             return poster + " " + posttime + "\n" + content
+        def to_str(self, indent=4):
+            return str(self).replace('\n', '\n'+' '*indent)
 
+        @classmethod
+        def fromId(cls, commentId: str):
+            if commentId in cls.__cached_comments:
+                _cmt = cls.__cached_comments[commentId]
+                _cmt.refresh(False)
+                return _cmt
+            else:
+                cmt_json = _check_token_expired(_session.get, page(f"comments/{commentId}")).json()
+                if not _check_error(cmt_json, False):
+                    return cls(**cmt_json)
+
+        def refresh(self, enabled_log=True):
+            cmt_json = _check_token_expired(_session.get, page(f"comments/{commentId}")).json()
+            if not _check_error(cmt_json, False):
+                self.__init__(**cmt_json)
+                if enabled_log:
+                    print("SubComments:", self.subCommentCount)
+            
         def like(self):
             return _check_token_expired(_session.post, page(f'comments/{self.id}/like'))
         def unlike(self):
@@ -246,6 +300,24 @@ class Post:
         def delete(self):
             dlcmt = _session.delete(page(f"comments/{self.id}"))
             return dlcmt
+
+        @property
+        def subcomments(self):
+            _post = Post.fromId(self.postId)
+            if not _post.enableNestedComment or not hasattr(self, 'subCommentCount'):
+                return iter([])
+            
+            uplimit = 100 # may be changed
+            for after in range(0, self.subCommentCount+uplimit, uplimit):
+                for comment in map(lambda kw: Post.Comment(**kw), _check_token_expired(_session.get, page(f"posts/{self.postId}/comments?parentId={self.id}&after={after}&limit={uplimit}")).json()):
+                    yield comment
+                    
+        def reply(self, content1, *contents):
+            _post = Post.fromId(self.postId)
+            if _post.enableNestedComment:
+                return reply(self, content1, *contents, parentId=self.id)
+            else:
+                print('[Error] Post does not allow nested comment', f'(post id: {self.postId})')
             
     def __init__(self, postid):
         # post info
@@ -256,6 +328,8 @@ class Post:
         self.forumId      = ""
         self.forumName    = ""
         self.forumAlias   = ""
+        self.enableNestedComment = False # nested comment
+        
         # host info
         self.gender         = ""    # F/M/D
         self.withNickname   = False # is with nickname
@@ -266,6 +340,7 @@ class Post:
         self.topics         = []    # topics
         
         self.createdAt    = ""
+        self.updatedAt    = ""
         self.isSuspiciousAcount = False
 
         self.commentCount = -1    #
@@ -279,11 +354,14 @@ class Post:
         # unknown            
         self.postAvatar   = ""
 
-        
+        # get post
         post_json = _check_token_expired(_session.get, page(f"posts/{postid}")).json()
         
         for _ in post_json:
             setattr(self, _, post_json[_])
+        
+        if self.id != -1:
+            self.__cached_posts.update({self.id: self})
 
     def __str__(self):
         title    = self.title
@@ -291,6 +369,15 @@ class Post:
         posttime = _datetime.strptime(self.createdAt, "%Y-%m-%dT%H:%M:%S.%fZ").astimezone(_timezone("Asia/Taipei")).strftime("%Y/%m/%d %H:%M:%S %Z%z")
         content  = self.content
         return "\n".join([title, poster + " " + posttime, content])
+
+    @classmethod
+    def fromId(cls, postid):
+        if postid in cls.__cached_posts:
+            _post = cls.__cached_posts[postid]
+            _post.refresh(False)
+            return _post
+        else:
+            return cls(postid)
 
     # like/unlike
     def like(self):
@@ -362,10 +449,11 @@ class Post:
     
 
     # post comments
-    def refresh(self):
+    def refresh(self, enabled_log=True):
         post_id = self.id
         self.__init__(self.id)
-        print("Comments:", self.commentCount)
+        if enabled_log:
+            print("Comments:", self.commentCount)
     def comment(self, floor):
         floors = self.commentCount
         if floor>floors:
@@ -383,6 +471,15 @@ class Post:
             for comment in map(lambda kw:Post.Comment(**kw), _check_token_expired(_session.get, page(f"posts/{self.id}/comments?after={after}&limit={uplimit}")).json()):
                 yield comment
         #return cmts
+    @property
+    def nested_comments(self):
+        if not self.enableNestedComment:
+            return self.comments
+        else:
+            for c in self.comments:
+                yield c
+                for sc in c.subcomments:
+                    yield sc
 
     @property
     def links(self):
@@ -602,8 +699,11 @@ def postImg(forum, title, content1, *contents, topics=(), reply="", anonymous=Fa
     '''
 
 
-def reply(postid, content1, *contents):
+def reply(postid, content1, *contents, **kwargs):
     suburl = f"posts/{postid}/comments"
+    if kwargs:
+        _args = '&'.join(map(lambda item: f'{item[0]}={item[1]}', kwargs.items()))
+        suburl += '?' + _args
 
     content = "\n".join([content1, *contents])
     
@@ -630,14 +730,15 @@ def reply(postid, content1, *contents):
     
     if content_more:
         content_more = f"(Continue B{cmt.floor} ...)\n\n" + content_more
-        reply(postid, content_more)
-    print(f"[Succeed] Replied: {p.title} - https://www.dcard.tw/f/{p.forumAlias}/p/{postid}?floor={cmt.floor}")
+        reply(postid, content_more, **kwargs)
+    #print(f"[Succeed] Replied: {p.title} - https://www.dcard.tw/f/{p.forumAlias}/p/{postid}?floor={cmt.floor}")
+    print(f"[Succeed] Replied: {p.title} - https://www.dcard.tw/f/{p.forumAlias}/p/{postid}/b/{cmt.floor}")
     return cmt
         
 
 
     
-def replyImg(postid, content1, *contents):
+def replyImg(postid, content1, *contents, **kwargs):
     #suburl = f"posts/{postid}/comments"
 
     content = ""
@@ -655,7 +756,7 @@ def replyImg(postid, content1, *contents):
             content += c
         content += "\n"
     
-    return reply(postid, content[:-1])
+    return reply(postid, content[:-1], **kwargs)
     
     '''
     if len(content) > 11000:
